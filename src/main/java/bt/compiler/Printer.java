@@ -133,7 +133,7 @@ public class Printer {
 
 		int p = 0;
 		while (p < length) {
-			if (p > 0) {
+			if (p > 0 && c!=null) {
 				// check if this is the start position of a method
 				for (Method m : c.getMethods()) {
 					if (m.address == p)
@@ -352,9 +352,7 @@ public class Printer {
 			case OpCode.e_op_code_SLP_DAT:
 				p += printOp(code, p, 1, out);
 				out.println("\tSLP_DAT");
-				out.print(tab);
-				p += print(code, p, 4, out);
-				out.println(" address");
+				p += printAddress(code, p, out, c);
 				break;
 			case OpCode.e_op_code_SLP_IMD:
 				p += printOp(code, p, 1, out);

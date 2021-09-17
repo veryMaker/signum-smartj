@@ -9,6 +9,7 @@ import java.awt.event.ActionEvent;
 import java.awt.event.ActionListener;
 import java.io.ByteArrayOutputStream;
 import java.io.PrintStream;
+import java.lang.reflect.Modifier;
 import java.nio.charset.StandardCharsets;
 
 import javax.swing.JButton;
@@ -25,12 +26,13 @@ import javax.swing.border.TitledBorder;
 import bt.BT;
 import bt.Contract;
 import bt.compiler.Compiler;
+import bt.compiler.Method;
 import bt.compiler.Printer;
-import burst.kit.entity.BurstAddress;
-import burst.kit.entity.BurstValue;
-import burst.kit.entity.response.AT;
-import burst.kit.entity.response.TransactionBroadcast;
-import burst.kit.entity.response.http.BRSError;
+import signumj.entity.SignumAddress;
+import signumj.entity.SignumValue;
+import signumj.entity.response.AT;
+import signumj.entity.response.TransactionBroadcast;
+import signumj.entity.response.http.BRSError;
 
 /**
  * Dialog to compile AT bytecode as well as to publish the contract on chain.
@@ -52,6 +54,8 @@ class CompileDialog extends JDialog implements ActionListener {
     private JTextArea codeArea;
 
     private JTextArea codeAreaForm;
+
+    private JTextArea methodHashArea;
 
     private Class<? extends Contract> atClass;
 
@@ -83,25 +87,25 @@ class CompileDialog extends JDialog implements ActionListener {
         nameField.setText(atClass.getSimpleName());
         config.add(descField = new HintTextField("Contract description", null));
         descField.setText(atClass.getSimpleName() + ", created with BlockTalk");
-        config.add(nodeField = new JComboBox<>());
-        nodeField.setToolTipText("BURST node address");
-        nodeField.setEditable(true);
-        nodeField.addItem(BT.NODE_TESTNET);
-        nodeField.addItem(BT.NODE_AT_TESTNET);
-        nodeField.addItem(BT.NODE_LOCAL_TESTNET);
-        nodeField.addItem(BT.NODE_BURSTCOIN_RO);
-        nodeField.addItem(BT.NODE_BURST_ALLIANCE);
-        nodeField.addItem(BT.NODE_BURST_TEAM);
-        nodeField.addItem(BT.NODE_BURSTCOIN_RO2);
 
         config.add(deadlineField = new HintTextField("Deadline in minutes", null));
         deadlineField.setText("1440"); // 4 days
-        config.add(feeField = new HintTextField("Fee in BURST", null));
+        config.add(feeField = new HintTextField("Deploy fee in BURST", null));
         feeField.setText("7.0");
-        config.add(actFeeField = new HintTextField("Activation fee in BURST", null));
-        actFeeField.setText("30.0");
+        config.add(actFeeField = new HintTextField("Gas fee in BURST", null));
+        actFeeField.setText(SignumValue.fromNQT(Contract.FEE_QUANT*40).toUnformattedString());
         config.add(passField = new JPasswordField());
         passField.setToolTipText("Passphrase, never sent over the wire");
+
+        config.add(nodeField = new JComboBox<>());
+        nodeField.setToolTipText("Node address");
+        nodeField.setEditable(true);
+        nodeField.addItem(BT.NODE_SIGNUM_EU);
+        nodeField.addItem(BT.NODE_SIGNUM_BR);
+        nodeField.addItem(BT.NODE_BURSTCOIN_RO);
+        nodeField.addItem(BT.NODE_LOCAL);
+        nodeField.addItem(BT.NODE_TESTNET_RO);
+        nodeField.addItem(BT.NODE_LOCAL_TESTNET);
 
         left.add(config, BorderLayout.CENTER);
 
@@ -114,11 +118,17 @@ class CompileDialog extends JDialog implements ActionListener {
         listContractsButton.addActionListener(this);
 
         JPanel codePanelForm = new JPanel(new BorderLayout());
-        codePanelForm.setBorder(new TitledBorder("AT FORMATTED BYTECODE"));
         codeAreaForm = new JTextArea(10, 30);
         codeAreaForm.setEditable(false);
         JScrollPane codeScrollForm = new JScrollPane(codeAreaForm);
+        codeScrollForm.setBorder(new TitledBorder("AT FORMATTED BYTECODE"));
         codePanelForm.add(codeScrollForm, BorderLayout.CENTER);
+        methodHashArea = new JTextArea(10, 30);
+        methodHashArea.setEditable(false);
+        JScrollPane methodHashAreaScroll = new JScrollPane(methodHashArea);
+        methodHashAreaScroll.setBorder(new TitledBorder("METHOD HASH"));
+        codePanelForm.add(methodHashAreaScroll, BorderLayout.PAGE_END);
+
         center.add(codePanelForm, BorderLayout.CENTER);
 
         JPanel buttons = new JPanel(new FlowLayout(FlowLayout.RIGHT));
@@ -157,13 +167,20 @@ class CompileDialog extends JDialog implements ActionListener {
             Printer.print(comp.getCode(), out, comp);
             String codeForm = new String(baos.toByteArray(), StandardCharsets.UTF_8);
 
-            BurstValue fee = BT.getMinRegisteringFee(comp);
+            SignumValue fee = BT.getMinRegisteringFee(comp);
             feeField.setText(fee.toUnformattedString());
 
             codeArea.setText(code);
             codeAreaForm.setText(codeForm);
             codeArea.setCaretPosition(0);
             codeAreaForm.setCaretPosition(0);
+            
+            methodHashArea.setText("");
+            for(Method m : comp.getMethods()) {
+            	if (m.getName().equals(Compiler.MAIN_METHOD) || m.getName().equals(Compiler.INIT_METHOD) || !Modifier.isPublic(m.getNode().access))
+					continue;
+            	methodHashArea.append(m.getName() + ": " + m.getHash() + "\n");
+            }
 
         } catch (Exception ex) {
             ex.printStackTrace();
@@ -184,8 +201,8 @@ class CompileDialog extends JDialog implements ActionListener {
             String description = descField.getText();
             BT.setNodeAddress(nodeField.getItemAt(nodeField.getSelectedIndex()));
 
-            BurstValue fee = BurstValue.fromBurst(feeField.getText());
-            BurstValue actFee = BurstValue.fromBurst(actFeeField.getText());
+            SignumValue fee = SignumValue.fromSigna(feeField.getText());
+            SignumValue actFee = SignumValue.fromSigna(actFeeField.getText());
             int deadline = Integer.parseInt(deadlineField.getText());
 
             BT.registerContract(passphrase, comp, name, description, actFee, fee, deadline)
@@ -205,7 +222,7 @@ class CompileDialog extends JDialog implements ActionListener {
             }
 
             BT.setNodeAddress(nodeField.getItemAt(nodeField.getSelectedIndex()));
-            BurstAddress address = BT.getBurstAddressFromPassphrase(passphrase);
+            SignumAddress address = BT.getAddressFromPassphrase(passphrase);
 
             AT ats[] = BT.getContracts(address);
 
@@ -241,6 +258,7 @@ class CompileDialog extends JDialog implements ActionListener {
     }
 
     private void handleError(Throwable t) {
+    	t.printStackTrace();
         setCursor(Cursor.getDefaultCursor());
         closeButton.setEnabled(true);
         publishButton.setEnabled(true);

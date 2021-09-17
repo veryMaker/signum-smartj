@@ -3,8 +3,8 @@ package bt;
 import java.util.ArrayList;
 import java.util.HashSet;
 
-import burst.kit.crypto.BurstCrypto;
-import burst.kit.entity.BurstID;
+import signumj.entity.SignumAddress;
+
 
 /**
  * Emulates the blockchain for debugging/testing purposes.
@@ -64,11 +64,9 @@ public class Emulator {
 		if (ret != null)
 			return ret;
 
-		BurstCrypto bc = BurstCrypto.getInstance();
 		long id = 0L;
 		try {
-			// Decode without the BURST- prefix
-			BurstID ad = bc.rsDecode(rs.substring(6));
+			SignumAddress ad = SignumAddress.fromRs(rs);
 			id = ad.getSignedLongId();
 		} catch (Exception e) {
 			// not a valid address, do nothing on the emulator
@@ -111,6 +109,11 @@ public class Emulator {
 		t.block = currentBlock;
 		txs.add(t);
 	}
+	
+	public void airDrop(String address, long amount) {
+		Address to = getAddress(address);
+		to.balance += amount;
+	}
 
 	public void airDrop(Address to, long amount) {
 		to.balance += amount;
@@ -123,21 +126,16 @@ public class Emulator {
 		Timestamp curBlockTs = new Timestamp(currentBlock.height, 0);
 
 		// check for sleeping contracts
-		for(Block b : blocks){
-			for(Transaction tx : b.txs){
-				if(tx.receiver==null || tx.receiver.contract==null)
-					continue;
+		for(Address ad : addresses){
+			if(ad.contract==null)
+				continue;
 
-				Contract c = tx.receiver.contract;
-				// sleeping contract
-				if(c.sleepUntil!=null && c.sleepUntil.le(curBlockTs)) {
-					// release to finish execution
-					c.semaphore.release();
-					// FIXME: consecutive sleep commands in contracts will not work, fix or not fix?
-					while(c.running && c.sleepUntil!=null){
-						Thread.sleep(10);
-					}
-				}
+			Contract c = ad.contract;
+			// sleeping contract
+			if(c.sleepUntil!=null && c.sleepUntil.le(curBlockTs)) {
+				// release to resume execution
+				c.semaphore.release();
+				Thread.sleep(100);
 			}
 		}
 
@@ -145,7 +143,7 @@ public class Emulator {
 		for (Transaction tx : currentBlock.txs) {
 
 			// checking for sleeping contracts
-			if (tx.receiver.contract != null && tx.receiver.contract.sleepUntil != null) {
+			if (tx.receiver.isSleeping()) {
 				// let it sleep, postpone this transaction
 				pendTxs.add(tx);
 				continue;
@@ -162,12 +160,30 @@ public class Emulator {
 			if (tx.type == Transaction.TYPE_AT_CREATE) {
 				// set the current creator variables
 				curTx = tx;
-				Object ocontract = Class.forName(tx.msgString).getConstructor().newInstance();
-				if (ocontract instanceof Contract) {
-					Contract c = (Contract) ocontract;
-
-					c.address = tx.receiver;
-					tx.receiver.contract = c;
+				
+				Thread ct = new Thread() {
+					public void run() {
+						// check the message arguments to call a specific function
+						try {
+							Object ocontract = Class.forName(tx.msgString).getConstructor().newInstance();
+							if (ocontract instanceof Contract) {
+								Contract c = (Contract) ocontract;
+								c.running = false;
+								tx.receiver.setSleeping(false);
+							}
+						} catch (Exception ex) {
+							ex.printStackTrace();
+						}
+					}
+				};
+				
+				ct.start();
+				while(tx.receiver.contract == null && !tx.receiver.isSleeping()){
+					Thread.sleep(10);
+				}
+				if(!tx.receiver.isSleeping()) {
+					tx.receiver.contract.semaphore.release();
+					tx.receiver.contract.running = false;
 				}
 			}
 		}
@@ -181,7 +197,7 @@ public class Emulator {
 		// run all contracts, operations will be pending to be forged in the next block
 		for (Transaction tx : prevBlock.txs) {
 
-			if (tx.receiver == null)
+			if (tx.receiver == null || tx.receiver.isSleeping())
 				continue;
 
 			// Check for contract

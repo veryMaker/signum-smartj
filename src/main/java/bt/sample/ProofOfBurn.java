@@ -1,29 +1,26 @@
 package bt.sample;
 
-import bt.*;
+import bt.Contract;
 import bt.compiler.CompilerVersion;
 import bt.compiler.TargetCompilerVersion;
 import bt.ui.EmulatorWindow;
 
 /**
- * A smart contract that simply echoes the message received.
+ * A smart contract that burns all BURST it receives.
  * 
  * @author jjos
  */
 @TargetCompilerVersion(CompilerVersion.v0_0_0)
-public class Echo extends Contract {
-	
+public class ProofOfBurn extends Contract {
 	/**
 	 * Any new transaction received will be handled by this function.
 	 */
 	public void txReceived(){
-		sendMessage(getCurrentTx().getMessage(), getCurrentTx().getSenderAddress());
+		sendAmount(getCurrentBalance(), getAddress(0L));
 	}
 
 	public static void main(String[] args) {
-		BT.activateCIP20(true);
-		new EmulatorWindow(Echo.class);
+		new EmulatorWindow(ProofOfBurn.class);
 	}
 }
-
 

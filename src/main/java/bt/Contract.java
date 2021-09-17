@@ -1,6 +1,5 @@
 package bt;
 
-import java.io.IOException;
 import java.lang.reflect.Field;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
@@ -8,8 +7,8 @@ import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.concurrent.Semaphore;
 
-import bt.compiler.Compiler;
-import burst.kit.crypto.BurstCrypto;
+import signumj.crypto.SignumCrypto;
+import signumj.entity.SignumID;
 
 /**
  * The BlockTalk smart contract abstract class.
@@ -46,8 +45,7 @@ public abstract class Contract {
 
 	protected Contract() {
 		Emulator emu = Emulator.getInstance();
-		setInitialVars(emu.curTx.getSenderAddress(), new Timestamp(emu.getCurrentBlock().getHeight(), 0),
-				emu.curTx.getAmount());
+		setInitialVars(emu.curTx, new Timestamp(emu.getCurrentBlock().getHeight(), 0));
 	}
 
 	/**
@@ -59,11 +57,20 @@ public abstract class Contract {
 	protected Address parseAddress(String rs) {
 		return Emulator.getInstance().getAddress(rs);
 	}
+	
+	/**
+	 * Utility function that return the address of a given ID
+	 * @param id the signed long id
+	 * @return the address
+	 */
+	protected Address getAddress(long id) {
+		return Emulator.getInstance().getAddress(SignumCrypto.getInstance().rsEncode(SignumID.fromLong(id)));
+	}
 
 	/**
 	 * Send the entire balance to the given address.
 	 * 
-	 * Care should be execised with this function since a contract with no balance
+	 * Care should be exercised with this function since a contract with no balance
 	 * cannot continue to run!
 	 * 
 	 * @param ad the address
@@ -109,6 +116,35 @@ public abstract class Contract {
 	 */
 	protected void sendMessage(Register message, Address receiver) {
 		Emulator.getInstance().send(address, receiver, 0, message);
+	}
+	
+	/**
+	 * Send the given message to the given address.
+	 * 
+	 * The message has the isText flag set as false, the given hexadecimal value is
+	 * converted to characters when shown in BRS wallet. Message is always
+	 * unencrypted.
+	 * 
+	 * @param message  the message in form of a long number
+	 * @param receiver the address
+	 */
+	protected void sendMessage(long message, Address receiver) {
+		Emulator.getInstance().send(address, receiver, 0, Register.newInstance(message, 0, 0, 0));
+	}
+	
+	/**
+	 * Send the given message to the given address.
+	 * 
+	 * The message has the isText flag set as false, the given hexadecimal values are
+	 * converted to characters when shown in BRS wallet. Message is always
+	 * unencrypted.
+	 * 
+	 * @param message  the message in form of a long number
+	 * @param message2  the message in form of a long number
+	 * @param receiver the address
+	 */
+	protected void sendMessage(long message, long message2, Address receiver) {
+		Emulator.getInstance().send(address, receiver, 0, Register.newInstance(message, message2, 0, 0));
 	}
 
 	/**
@@ -199,6 +235,13 @@ public abstract class Contract {
 	protected Timestamp getBlockTimestamp() {
 		return new Timestamp(Emulator.getInstance().getCurrentBlock().getHeight(), 0);
 	}
+	
+	/**
+	 * @return the timestamp of the block being processed
+	 */
+	protected long getBlockHeight() {
+		return Emulator.getInstance().getCurrentBlock().getHeight();
+	}
 
 	/**
 	 * @return the address of the creator of this contract
@@ -270,26 +313,31 @@ public abstract class Contract {
 	}
 
 	/**
-	 * Sleeps until the next block.
+	 * Sleeps until the contract receives a new transaction.
 	 */
-	protected void sleepOneBlock() {
-		sleep(null);
+	protected void sleepUntilNextTx() {
+		// FIXME: on emulator we will sleep for one block
+		sleep(0);
 	}
 
 	/**
-	 * Sleep until the given timestamp.
+	 * Sleeps for the given number of blocks.
 	 * 
-	 * @param ts
+	 * @param nblocks number of blocks to sleep
 	 */
-	protected void sleep(Timestamp ts) {
-		sleepUntil = ts;
-		if (sleepUntil == null)
-			sleepUntil = new Timestamp(0, 0);
-		try {
-			semaphore.acquire();
-		} catch (InterruptedException e) {
-			e.printStackTrace();
+	protected void sleep(long nblocks) {
+		if(nblocks <= 0)
+			sleepUntil = null;
+		else {
+			sleepUntil = new Timestamp(Emulator.getInstance().getCurrentBlock().height + nblocks, 0);
+			address.setSleeping(true);
+			try {
+				semaphore.acquire();
+			} catch (InterruptedException e) {
+				e.printStackTrace();
+			}
 		}
+		address.setSleeping(false);
 		sleepUntil = null;
 	}
 
@@ -305,10 +353,21 @@ public abstract class Contract {
 	// machine when in debug mode but not exported to the
 	// AT blockchain machine code
 
-	void setInitialVars(Address creator, Timestamp creation, long activationFee) {
-		this.creator = creator;
+	void setInitialVars(Transaction tx, Timestamp creation) {
+		this.creator = tx.sender;
+		this.address = tx.receiver;
 		this.creation = creation;
-		this.activationFee = activationFee;
+		this.activationFee = tx.getAmount();
+		this.address.contract = this;
+		
+		// we acquire the semaphore in the creation process, it is released
+		// when finished by the emulator
+		try {
+			running = true;
+			semaphore.acquire();
+		} catch (InterruptedException e) {
+			running =false;
+		}
 	}
 
 	void setCurrentTx(Transaction current) {
@@ -329,63 +388,5 @@ public abstract class Contract {
 			}
 		}
 		return ret;
-	}
-
-	/**
-	 * This method should **NOT** be called except from in a main() method for
-	 * convenience. Class detection taken from
-	 * javafx.application.Application::launch
-	 * 
-	 * @return The AT code byte
-	 */
-	@EmulatorWarning
-	protected static byte[] compile() {
-		// Figure out the right class to call
-		StackTraceElement[] cause = Thread.currentThread().getStackTrace();
-
-		boolean foundThisMethod = false;
-		String callingClassName = null;
-		for (StackTraceElement se : cause) {
-			// Skip entries until we get to the entry for this class
-			String className = se.getClassName();
-			String methodName = se.getMethodName();
-			if (foundThisMethod) {
-				callingClassName = className;
-				break;
-			} else if (Contract.class.getName().equals(className) && "compile".equals(methodName)) {
-				foundThisMethod = true;
-			}
-		}
-
-		if (callingClassName == null) {
-			throw new RuntimeException("Error: unable to determine contract class");
-		}
-
-		try {
-			Class theClass = Class.forName(callingClassName, false, Thread.currentThread().getContextClassLoader());
-			if (Contract.class.isAssignableFrom(theClass)) {
-				// noinspection unchecked
-				byte[] code = compile(theClass);
-				if (code != null)
-					System.out.println("Compiled AT bytecode: " + BurstCrypto.getInstance().toHexString(code));
-				return code;
-			} else {
-				throw new RuntimeException("Error: " + theClass + " is not a subclass of bt.Contract");
-			}
-		} catch (RuntimeException ex) {
-			throw ex;
-		} catch (Exception ex) {
-			throw new RuntimeException(ex);
-		}
-	}
-
-	private static byte[] compile(Class<? extends Contract> clazz) throws IOException {
-		Compiler compiler = new Compiler(clazz);
-		compiler.compile();
-		if (compiler.getErrors().size() > 0)
-			return null;
-
-		compiler.link();
-		return compiler.getCode();
 	}
 }

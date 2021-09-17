@@ -8,17 +8,17 @@ import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
-import java.util.ArrayList;
-import java.util.Collection;
-import java.util.HashMap;
-import java.util.Iterator;
-import java.util.LinkedList;
+import java.util.*;
+import java.util.Arrays;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 import bt.*;
+import signumj.crypto.SignumCrypto;
+import signumj.entity.SignumAddress;
 
-import burst.kit.crypto.BurstCrypto;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 import org.objectweb.asm.ClassReader;
 import org.objectweb.asm.tree.AbstractInsnNode;
 import org.objectweb.asm.tree.ClassNode;
@@ -32,7 +32,6 @@ import org.objectweb.asm.tree.MethodInsnNode;
 import org.objectweb.asm.tree.MethodNode;
 import org.objectweb.asm.tree.VarInsnNode;
 
-import burst.kit.entity.BurstID;
 
 /**
  * Class to convert a {@link Contract} java bytecode to ciyam bytecode.
@@ -49,9 +48,10 @@ public class Compiler {
 	public static final String FINISHED_METHOD = "blockFinished";
 	public static final String TX_RECEIVED_METHOD = "txReceived";
 	public static final int PAGE_SIZE = 256;
-	public static final int MAX_SIZE = 10 * PAGE_SIZE;
 
 	private static final String UNEXPECTED_ERROR = "Unexpected error, please report at https://github.com/burst-apps-team/blocktalk/issues";
+	
+	private static Logger logger = LogManager.getLogger();
 
 	ClassNode cn;
 	ByteBuffer code;
@@ -100,13 +100,13 @@ public class Compiler {
 		this.className = clazz.getName();
 		TargetCompilerVersion targetCompilerVersion = clazz.getAnnotation(TargetCompilerVersion.class);
 		if (targetCompilerVersion == null) {
-			System.err.println("WARNING: Target compiler version not specified");
+			logger.warn("WARNING: Target compiler version not specified");
 		} else if (targetCompilerVersion.value() != currentVersion) {
 			if (targetCompilerVersion.value().ordinal() > currentVersion.ordinal())
-				System.err.println(
+				logger.error(
 						"WARNING: Target compiler version newer than compiler version. Newer features may not compile or work.");
 			if (targetCompilerVersion.value().ordinal() < currentVersion.ordinal())
-				System.err.println(
+				logger.error(
 						"WARNING: Target compiler version older than compiler version. Contract source code may be incompatible.");
 		}
 
@@ -198,7 +198,7 @@ public class Compiler {
 		useCreator = false;
 
 		for (FieldNode f : cn.fields) {
-			// System.out.println("field name:" + f.name);
+			logger.debug("field name: {}", f.name);
 			int nvars = 0;
 
 			if (Modifier.isFinal(f.access) && Modifier.isStatic(f.access))
@@ -266,7 +266,7 @@ public class Compiler {
 
 	public void compile() {
 		readFields();
-		readMethods();
+		readMethods();		
 	}
 
 	private void initialCode() {
@@ -294,6 +294,7 @@ public class Compiler {
 
 		// The starting point for future calls (PCS)
 		code.put(OpCode.e_op_code_SET_PCS);
+		int afterPCSAddress = code.position();
 		// Check if we have a blockStarted method and put it here
 		Method startedMethod = getMethod(STARTED_METHOD);
 		boolean hasStarted = startedMethod != null && startedMethod.code.position() > 1;
@@ -303,14 +304,14 @@ public class Compiler {
 		}
 
 		// Point to restart for a new transaction
-		int afterPCSAddress = code.position();
+		int afterBlockStartedAddress = code.position();
 
 		if (hasPublicMethods || hasTxReceived) {
 			// put the last transaction received in A (after the last timestamp)
 			code.put(OpCode.e_op_code_EXT_FUN_DAT);
 			code.putShort(OpCode.A_To_Tx_After_Timestamp);
 			code.putInt(lastTxTimestamp);
-
+			
 			// get the value from A1
 			code.put(OpCode.e_op_code_EXT_FUN_RET);
 			code.putShort(OpCode.Get_A1);
@@ -323,11 +324,30 @@ public class Compiler {
 		if (hasPublicMethods || hasTxReceived) {
 			code.put(OpCode.e_op_code_BNZ_DAT);
 			code.putInt(lastTxReceived);
-			code.put((byte) (7 + (hasFinish ? 5 : 0)));
+			code.put((byte) (7 + (hasFinish ? 30 : 0)));
 		}
 		if (hasFinish) {
 			code.put(OpCode.e_op_code_JMP_SUB);
 			code.putInt(finishMethod.address);
+			
+			// Check if there is no new tx incoming.
+			// This is in case we run out of balance during the finish method.
+			code.put(OpCode.e_op_code_EXT_FUN_DAT);
+			code.putShort(OpCode.A_To_Tx_After_Timestamp);
+			code.putInt(lastTxTimestamp);
+			
+			// get the value from A1
+			code.put(OpCode.e_op_code_EXT_FUN_RET);
+			code.putShort(OpCode.Get_A1);
+			code.putInt(tmpVar1);
+
+			// If zero we finish, otherwise we restart
+			code.put(OpCode.e_op_code_BZR_DAT);
+			code.putInt(tmpVar1);
+			code.put((byte) 11);
+			
+			code.put(OpCode.e_op_code_JMP_ADR);
+			code.putInt(afterPCSAddress);
 		}
 		code.put(OpCode.e_op_code_FIN_IMD);
 
@@ -390,7 +410,7 @@ public class Compiler {
 				code.putInt(m.address);
 				// end this run (check for the next transaction)
 				code.put(OpCode.e_op_code_JMP_ADR);
-				code.putInt(afterPCSAddress);
+				code.putInt(afterBlockStartedAddress);
 			}
 		}
 
@@ -405,14 +425,14 @@ public class Compiler {
 		if (hasPublicMethods || hasTxReceived) {
 			// restart for a possible new transaction
 			code.put(OpCode.e_op_code_JMP_ADR);
-			code.putInt(afterPCSAddress);
+			code.putInt(afterBlockStartedAddress);
 		}
 	}
 
 	public void link() {
 		// we allow here a larger size, there will be an error when registering
-		// if we pass the actuall limit
-		code = ByteBuffer.allocate(2 * MAX_SIZE);
+		// if we pass the actual limit
+		code = ByteBuffer.allocate(40 * Compiler.PAGE_SIZE);
 		code.order(ByteOrder.LITTLE_ENDIAN);
 
 		initialCode();
@@ -503,10 +523,10 @@ public class Compiler {
 
 		// Then parse
 		for (Method m : methods.values()) {
-			System.out.print("** METHOD: " + m.node.name);
-			if (m.hash != 0)
-				System.out.print(" hash: " + m.hash);
-			System.out.println();
+			logger.debug("** METHOD: {}", m.node.name);
+			if (m.hash != 0) {
+				logger.info("METHOD: {}, hash: {}", m.node.name, m.hash);
+			}
 			parseMethod(m);
 
 			if (m.node.name.equals(TX_RECEIVED_METHOD) && m.code.position() > 1)
@@ -623,7 +643,7 @@ public class Compiler {
 	}
 
 	private void parseMethod(Method m) {
-		ByteBuffer code = ByteBuffer.allocate(Compiler.MAX_SIZE);
+		ByteBuffer code = ByteBuffer.allocate(40 * Compiler.PAGE_SIZE);
 		code.order(ByteOrder.LITTLE_ENDIAN);
 
 		m.code = code;
@@ -651,13 +671,14 @@ public class Compiler {
 			AbstractInsnNode insn = ite.next();
 
 			int opcode = insn.getOpcode();
+			checkNotUnsupported(opcode);
 
 			if (opcode == -1) {
 				// This is a label or line number information
 				if (insn instanceof LabelNode) {
 					LabelNode ln = (LabelNode) insn;
 					labels.put(ln, code.position());
-					System.out.println("label: " + ln.getLabel());
+					logger.debug("label: {}", ln.getLabel());
 				}
 				/*
 				 * else if(insn instanceof LineNumberNode) { LineNumberNode ln =
@@ -673,14 +694,15 @@ public class Compiler {
 			}
 
 			if (stack.size() > 0) {
-				System.out.print("Stack");
+				logger.debug("Stack");
 				for (StackVar var : stack) {
-					System.out.print(": " + var.toString());
+					logger.debug(": " + var.toString());
 				}
-				System.out.println();
 			}
 
 			switch (opcode) {
+			case NOP:
+				break;
 			case ILOAD:
 			case LLOAD:
 			case ALOAD:
@@ -708,7 +730,7 @@ public class Compiler {
 						// local 0 is 'this'
 						stack.add(new StackVar(STACK_THIS, null));
 					}
-					System.out.println((opcode < ISTORE ? "load" : "store") + " local: " + vi.var);
+					logger.debug((opcode < ISTORE ? "load" : "store") + " local: " + vi.var);
 				} else {
 					addError(insn, UNEXPECTED_ERROR);
 				}
@@ -724,7 +746,7 @@ public class Compiler {
 					// local 0 is 'this', others are stored after 'localStart' variable
 
 					arg1 = popVar(m, tmpVar1, false);
-					System.out.println("store local: " + vi.var);
+					logger.debug("store local: " + vi.var);
 
 					// tmpVar2 have the local index, starting at localStart
 					useLocal = true;
@@ -774,6 +796,7 @@ public class Compiler {
 				pushVar(m, arg1.address);
 				break;
 
+			case ICONST_M1:
 			case ICONST_1:
 			case ICONST_2:
 			case ICONST_3:
@@ -784,7 +807,7 @@ public class Compiler {
 				code.putLong(opcode - ICONST_0);
 
 				pushVar(m, tmpVar2);
-				System.out.println("iconstant : " + (opcode - ICONST_0));
+				logger.debug("iconstant : " + (opcode - ICONST_0));
 				break;
 
 			case LCONST_1:
@@ -793,7 +816,7 @@ public class Compiler {
 				code.putLong(opcode - LCONST_0);
 
 				pushVar(m, tmpVar2);
-				System.out.println("lconstant : " + (opcode - LCONST_0));
+				logger.debug("lconstant : " + (opcode - LCONST_0));
 				break;
 
 			case ACONST_NULL:
@@ -803,7 +826,7 @@ public class Compiler {
 				code.putInt(tmpVar2);
 
 				pushVar(m, tmpVar2);
-				System.out.println("load null/zero");
+				logger.debug("load null/zero");
 				break;
 
 			case IADD:
@@ -820,6 +843,8 @@ public class Compiler {
 			case LAND:
 			case IOR:
 			case LOR:
+			case IXOR:
+			case LXOR:
 				// we should have two arguments on the stack
 				arg2 = popVar(m, tmpVar2, false);
 				arg1 = popVar(m, tmpVar1, true);
@@ -827,36 +852,41 @@ public class Compiler {
 				switch (opcode) {
 				case ISUB:
 				case LSUB:
-					System.out.println("sub");
+					logger.debug("sub");
 					code.put(OpCode.e_op_code_SUB_DAT);
 					break;
 				case IMUL:
 				case LMUL:
-					System.out.println("mul");
+					logger.debug("mul");
 					code.put(OpCode.e_op_code_MUL_DAT);
 					break;
 				case IDIV:
 				case LDIV:
-					System.out.println("div");
+					logger.debug("div");
 					code.put(OpCode.e_op_code_DIV_DAT);
 					break;
 				case IREM:
 				case LREM:
-					System.out.println("mod");
+					logger.debug("mod");
 					code.put(OpCode.e_op_code_MOD_DAT);
 					break;
 				case IAND:
 				case LAND:
-					System.out.println("AND");
+					logger.debug("AND");
 					code.put(OpCode.e_op_code_AND_DAT);
 					break;
 				case IOR:
 				case LOR:
-					System.out.println("OR");
+					logger.debug("OR");
 					code.put(OpCode.e_op_code_BOR_DAT);
 					break;
+				case IXOR:
+				case LXOR:
+					logger.debug("XOR");
+					code.put(OpCode.e_op_code_XOR_DAT);
+					break;
 				default:
-					System.out.println("add");
+					logger.debug("add");
 					code.put(OpCode.e_op_code_ADD_DAT);
 					break;
 				}
@@ -867,7 +897,7 @@ public class Compiler {
 				break;
 			case INEG:
 			case LNEG:
-				System.out.println("neg");
+				logger.debug("neg");
 
 				arg1 = popVar(m, tmpVar2, false);
 
@@ -892,7 +922,7 @@ public class Compiler {
 				}
 			case RETURN:
 				// Recalling that every method call will use JMP_SUB
-				System.out.println("return");
+				logger.debug("return");
 				code.put(OpCode.e_op_code_RET_SUB);
 				break;
 
@@ -909,7 +939,7 @@ public class Compiler {
 					addError(insn, UNEXPECTED_ERROR);
 				}
 
-				System.out.println("dup");
+				logger.debug("dup");
 			}
 				break;
 
@@ -922,7 +952,7 @@ public class Compiler {
 					MethodInsnNode mi = (MethodInsnNode) insn;
 					String owner = mi.owner.replace('/', '.');
 
-					System.out.println("invoke, name:" + mi.name + " owner:" + owner);
+					logger.debug("invoke, name:" + mi.name + " owner:" + owner);
 
 					if (owner.equals(Contract.class.getName())) {
 						if (mi.name.equals(INIT_METHOD)) {
@@ -1004,9 +1034,7 @@ public class Compiler {
 
 							long value = 0;
 							try {
-								BurstCrypto bc = BurstCrypto.getInstance();
-								// Decode without the BURST- prefix
-								BurstID ad = bc.rsDecode(address.svalue.substring(6));
+								SignumAddress ad = SignumAddress.fromRs(address.svalue);
 								value = ad.getSignedLongId();
 							} catch (IllegalArgumentException ex) {
 								addError(mi, ex.getMessage());
@@ -1016,6 +1044,11 @@ public class Compiler {
 							code.putInt(tmpVar1);
 							code.putLong(value);
 							pushVar(m, tmpVar1);
+						} else if (mi.name.equals("getAddress")) {
+							arg1 = popVar(m, tmpVar1, false); // the address
+							stack.pollLast(); // remove the "this" from stack
+							
+							pushVar(m, arg1.address);
 						} else if (mi.name.equals("getCreator")) {
 							stack.pollLast(); // remove the "this" from stack
 
@@ -1034,6 +1067,23 @@ public class Compiler {
 							code.put(OpCode.e_op_code_EXT_FUN_RET);
 							code.putShort(OpCode.Get_Block_Timestamp);
 							code.putInt(tmpVar1);
+							pushVar(m, tmpVar1);
+						} else if (mi.name.equals("getBlockHeight")) {
+							stack.pollLast(); // remove the "this" from stack
+
+							code.put(OpCode.e_op_code_EXT_FUN_RET);
+							code.putShort(OpCode.Get_Block_Timestamp);
+							code.putInt(tmpVar1);
+							
+							// Get only the block height, removing the number of txs
+							code.put(OpCode.e_op_code_SET_VAL);
+							code.putInt(tmpVar2);
+							code.putLong(32L);
+
+							code.put(OpCode.e_op_code_SHR_DAT);
+							code.putInt(tmpVar1);
+							code.putInt(tmpVar2);
+							
 							pushVar(m, tmpVar1);
 						} else if (mi.name.equals("getPrevBlockHash")) {
 							stack.pollLast(); // remove the "this" from stack
@@ -1075,7 +1125,7 @@ public class Compiler {
 							stack.pollLast(); // remove the "this" from stack
 
 							code.put(OpCode.e_op_code_SLP_DAT);
-							code.putInt(tmpVar1);
+							code.putInt(arg1.address);
 						} else if (mi.name.equals("sendAmount")) {
 							arg1 = popVar(m, tmpVar1, false); // address
 							arg2 = popVar(m, tmpVar2, false); // amount
@@ -1176,7 +1226,34 @@ public class Compiler {
 									code.putShort((short) (OpCode.Set_A1 + a));
 									code.putInt(tmpVar1);
 								}
-							} else {
+							}
+							else if (mi.desc.equals("(JLbt/Address;)V")) {
+								// single long argument
+								StackVar msg = popVar(m, tmpVar1, false);
+								
+								code.put(OpCode.e_op_code_EXT_FUN);
+								code.putShort(OpCode.Clear_A);
+								
+								code.put(OpCode.e_op_code_EXT_FUN_DAT);
+								code.putShort((short) (OpCode.Set_A1));
+								code.putInt(msg.address);
+							}
+							else if (mi.desc.equals("(JJLbt/Address;)V")) {
+								// two long arguments
+								StackVar msg = popVar(m, tmpVar1, false);
+								StackVar msg2 = popVar(m, tmpVar2, false);
+								
+								code.put(OpCode.e_op_code_EXT_FUN);
+								code.putShort(OpCode.Clear_A);
+								
+								code.put(OpCode.e_op_code_EXT_FUN_DAT);
+								code.putShort((short) (OpCode.Set_A1));
+								code.putInt(msg.address);
+								code.put(OpCode.e_op_code_EXT_FUN_DAT);
+								code.putShort((short) (OpCode.Set_A2));
+								code.putInt(msg2.address);
+							}
+							else {
 								// We should have received a Register, it is on stack
 								for (int i = 3; i >= 0; i--) {
 									StackVar reg = popVar(m, tmpVar1, false);
@@ -1192,7 +1269,6 @@ public class Compiler {
 							stack.pollLast(); // remove the 'this'
 						} else {
 							// check for user defined methods
-							stack.pollLast(); // remove the 'this'
 							Method mcall = methods.get(mi.name);
 							if (mcall == null) {
 								addError(mi, "Method not found: " + mi.name);
@@ -1230,6 +1306,7 @@ public class Compiler {
 									code.putInt(tmpVar2);
 								}
 							}
+							stack.pollLast(); // remove the 'this'
 
 							// call method here
 							code.put(OpCode.e_op_code_JMP_SUB);
@@ -1307,6 +1384,118 @@ public class Compiler {
 								code.putInt(tmpVar1); // the message contents
 								pushVar(m, tmpVar1);
 							}
+						} else if (mi.name.equals("checkMessageSHA256")) {
+							arg4 = popVar(m, tmpVar1, false); // input4
+							arg3 = popVar(m, tmpVar2, false); // input3
+							arg2 = popVar(m, tmpVar3, false); // input2
+							arg1 = popVar(m, tmpVar4, false); // input1
+
+							StackVar txArg = popVar(m, tmpVar5, false); // the TX address
+
+							code.put(OpCode.e_op_code_EXT_FUN_DAT);
+							code.putShort(OpCode.Set_A1);
+							code.putInt(txArg.address); // the TX address
+
+							code.put(OpCode.e_op_code_EXT_FUN);
+							code.putShort(OpCode.Message_From_Tx_In_A_To_B);
+							
+							code.put(OpCode.e_op_code_EXT_FUN);
+							code.putShort(OpCode.Copy_A_From_B);
+							
+							code.put(OpCode.e_op_code_EXT_FUN_DAT);
+							code.putShort(OpCode.Set_B1);
+							code.putInt(arg1.address); // address
+							code.put(OpCode.e_op_code_EXT_FUN_DAT);
+							code.putShort(OpCode.Set_B2);
+							code.putInt(arg2.address); // address
+							code.put(OpCode.e_op_code_EXT_FUN_DAT);
+							code.putShort(OpCode.Set_B3);
+							code.putInt(arg3.address); // address
+							code.put(OpCode.e_op_code_EXT_FUN_DAT);
+							code.putShort(OpCode.Set_B4);
+							code.putInt(arg4.address); // address
+							
+							code.put(OpCode.e_op_code_EXT_FUN_RET);
+							code.putShort(OpCode.Check_SHA256_A_With_B);
+							code.putInt(tmpVar1); // the check result
+							
+							pushVar(m, tmpVar1);
+							
+						} else if (mi.name.equals("checkMessageSHA256_192")) {
+							arg4 = popVar(m, tmpVar4, false); // input4
+							arg3 = popVar(m, tmpVar3, false); // input3
+							arg2 = popVar(m, tmpVar2, false); // input2
+							arg1 = popVar(m, tmpVar1, false); // input1
+
+							StackVar txArg = popVar(m, tmpVar5, false); // the TX address
+
+							code.put(OpCode.e_op_code_EXT_FUN_DAT);
+							code.putShort(OpCode.Set_A1);
+							code.putInt(txArg.address); // the TX address
+
+							code.put(OpCode.e_op_code_EXT_FUN);
+							code.putShort(OpCode.Message_From_Tx_In_A_To_B);
+							
+							code.put(OpCode.e_op_code_EXT_FUN);
+							code.putShort(OpCode.Copy_A_From_B);
+							
+							code.put(OpCode.e_op_code_EXT_FUN);
+							code.putShort(OpCode.SHA256_A_To_B);
+							
+							// tmpVar1 will be zero if match
+							code.put(OpCode.e_op_code_CLR_DAT);
+							code.putInt(tmpVar1);
+
+							// check 2
+							code.put(OpCode.e_op_code_EXT_FUN_RET);
+							code.putShort((short) (OpCode.Get_B2));
+							code.putInt(tmpVar5);
+							code.put(OpCode.e_op_code_SUB_DAT);
+							code.putInt(tmpVar5);
+							code.putInt(arg2.address);
+							code.put(OpCode.e_op_code_BNZ_DAT);
+							code.putInt(tmpVar5);
+							code.put((byte) 0x0b); // offset
+							code.put(OpCode.e_op_code_INC_DAT);
+							code.putInt(tmpVar1);
+							
+							// check 3
+							code.put(OpCode.e_op_code_EXT_FUN_RET);
+							code.putShort((short) (OpCode.Get_B3));
+							code.putInt(tmpVar5);
+							code.put(OpCode.e_op_code_SUB_DAT);
+							code.putInt(tmpVar5);
+							code.putInt(arg3.address);
+							code.put(OpCode.e_op_code_BNZ_DAT);
+							code.putInt(tmpVar5);
+							code.put((byte) 0x0b); // offset
+							code.put(OpCode.e_op_code_INC_DAT);
+							code.putInt(tmpVar1);
+							
+							// check 4
+							code.put(OpCode.e_op_code_EXT_FUN_RET);
+							code.putShort((short) (OpCode.Get_B4));
+							code.putInt(tmpVar5);
+							code.put(OpCode.e_op_code_SUB_DAT);
+							code.putInt(tmpVar5);
+							code.putInt(arg4.address);
+							code.put(OpCode.e_op_code_BNZ_DAT);
+							code.putInt(tmpVar5);
+							code.put((byte) 0x0b); // offset
+							code.put(OpCode.e_op_code_INC_DAT);
+							code.putInt(tmpVar1);
+							
+							// tmpVar1 is zero if match, so we return 1 if match
+							code.put(OpCode.e_op_code_CLR_DAT);
+							code.putInt(tmpVar2);
+							code.put(OpCode.e_op_code_BNZ_DAT);
+							code.putInt(tmpVar1);
+							code.put((byte) 0x0b); // offset
+							code.put(OpCode.e_op_code_INC_DAT);
+							code.putInt(tmpVar2);
+							
+							pushVar(m, tmpVar2);
+							
 						} else if (mi.name.equals("getMessage1")) {
 							arg1 = popVar(m, tmpVar1, false); // the TX address
 
@@ -1320,6 +1509,21 @@ public class Compiler {
 							// we push only the first long to the stack
 							code.put(OpCode.e_op_code_EXT_FUN_RET);
 							code.putShort((short) (OpCode.Get_B1));
+							code.putInt(tmpVar1); // the message contents
+							pushVar(m, tmpVar1);
+						} else if (mi.name.equals("getMessage2")) {
+							arg1 = popVar(m, tmpVar1, false); // the TX address
+
+							code.put(OpCode.e_op_code_EXT_FUN_DAT);
+							code.putShort(OpCode.Set_A1);
+							code.putInt(arg1.address); // the TX address
+
+							code.put(OpCode.e_op_code_EXT_FUN);
+							code.putShort(OpCode.Message_From_Tx_In_A_To_B);
+
+							// we push only the first long to the stack
+							code.put(OpCode.e_op_code_EXT_FUN_RET);
+							code.putShort((short) (OpCode.Get_B2));
 							code.putInt(tmpVar1); // the message contents
 							pushVar(m, tmpVar1);
 						} else {
@@ -1356,7 +1560,7 @@ public class Compiler {
 							int pos = Integer.parseInt(mi.name.substring(mi.name.length() - 1)) - 1;
 							pushVar(m, values[pos].address);
 						}
-						if (mi.name.equals("equals")) {
+						else if (mi.name.equals("equals")) {
 							code.put(OpCode.e_op_code_CLR_DAT);
 							code.putInt(tmpVar5);
 
@@ -1410,7 +1614,7 @@ public class Compiler {
 				if (insn instanceof FieldInsnNode) {
 					FieldInsnNode fi = (FieldInsnNode) insn;
 
-					System.out.println((opcode == GETFIELD ? "get " : "put ") + "field: " + fi.name);
+					logger.debug((opcode == GETFIELD ? "get " : "put ") + "field: " + fi.name);
 
 					Field field = fields.get(fi.name);
 					if (opcode == GETFIELD) {
@@ -1434,7 +1638,7 @@ public class Compiler {
 						// java.lang.invoke.MethodType, or java.lang.invoke.MethodHandle) onto the stack
 				if (insn instanceof LdcInsnNode) {
 					LdcInsnNode ld = (LdcInsnNode) insn;
-					System.out.println("constant: " + ld.cst);
+					logger.debug("constant: " + ld.cst);
 
 					if (ld.cst instanceof String) {
 						stack.addLast(new StackVar(STACK_CONSTANT, ld.cst));
@@ -1466,7 +1670,7 @@ public class Compiler {
 				code.putInt(arg2.address);
 				pushVar(m, arg1.address);
 
-				System.out.println("lcmp");
+				logger.debug("lcmp");
 				break;
 
 			case IFEQ:
@@ -1531,7 +1735,7 @@ public class Compiler {
 					m.jumps.add(new Method.Jump(code.position(), jmp.label));
 					code.putInt(0); // address, to be resolved later
 
-					System.out.println("ifeq: " + jmp.label.getLabel());
+					logger.debug("ifeq: " + jmp.label.getLabel());
 				} else {
 					addError(insn, UNEXPECTED_ERROR);
 				}
@@ -1560,7 +1764,7 @@ public class Compiler {
 					m.jumps.add(new Method.Jump(code.position(), jmp.label));
 					code.putInt(0); // to be resolved later
 
-					System.out.println("ifeq: " + jmp.label.getLabel());
+					logger.debug("ifeq: " + jmp.label.getLabel());
 				} else {
 					addError(insn, UNEXPECTED_ERROR);
 				}
@@ -1575,7 +1779,7 @@ public class Compiler {
 				break;
 
 			default:
-				addError(insn, "Unsupported opcode: " + opcode);
+				addError(insn, "OpCode Not Implemented: " + opcode);
 				break;
 			}
 		}
@@ -1602,7 +1806,7 @@ public class Compiler {
 	}
 
 	public static long getMethodSignature(Method m) {
-		BurstCrypto burstCrypto = BurstCrypto.getInstance();
+		SignumCrypto burstCrypto = SignumCrypto.getInstance();
 		MessageDigest sha256 = burstCrypto.getSha256();
 		return burstCrypto.hashToId(sha256.digest((m.node.name + m.node.desc).getBytes(StandardCharsets.UTF_8)))
 				.getSignedLongId(); // TODO replace
@@ -1646,6 +1850,20 @@ public class Compiler {
 				method.localArgTotal += argSize;
 			}
 			method.nargs++;
+		}
+	}
+
+	private static final List<Integer> unsupportedOpcodes = Arrays.asList(
+			ATHROW,
+			CHECKCAST,
+			INSTANCEOF,
+			MONITORENTER,
+			MONITOREXIT
+	);
+
+	private void checkNotUnsupported(int opcode) {
+		if (unsupportedOpcodes.contains(opcode)) {
+			throw new UnsupportedOperationException("OpCode " + opcode + " not supported");
 		}
 	}
 }
